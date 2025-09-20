@@ -11,6 +11,10 @@ from pathlib import Path
 import re
 
 from ..core.base import BaseDataLoader
+from ..utils.logger import get_logger
+from ..utils.validators import DataValidator
+from ..utils.error_handlers import DataLoadError, ValidationError, create_error_handler
+from ..utils.progress import TrainingProgressTracker
 
 class ParkinsonDataLoader(BaseDataLoader):
     """
@@ -31,40 +35,83 @@ class ParkinsonDataLoader(BaseDataLoader):
         self.subject_id_column = config.get('subject_id_column', 'subject_id')
         self.feature_columns = config.get('feature_columns')
         
+        # Enhanced logging and validation
+        self.logger = get_logger(self.__class__.__name__)
+        self.validator = DataValidator(self.logger)
+        self.error_handler = create_error_handler("data", self.logger)
+        self.progress_tracker = TrainingProgressTracker(self.logger)
+        
     def load_data(self) -> pd.DataFrame:
         """
-        Load data from CSV file
+        Load data from CSV file with enhanced validation and error handling
         
         Returns:
             Loaded DataFrame
         """
+        self.progress_tracker.start_phase("Data Loading", 5)
+        
         try:
-            self.logger.info(f"Loading data from: {self.data_path}")
+            # Step 1: Validate file before loading
+            self.progress_tracker.update_phase(1, "Validating data file")
+            file_validation = self.validator.validate_data_file(self.data_path)
             
-            # Check if file exists
-            if not Path(self.data_path).exists():
-                raise FileNotFoundError(f"Data file not found: {self.data_path}")
+            if not file_validation['valid']:
+                error_msg = f"Data file validation failed: {'; '.join(file_validation['errors'])}"
+                raise DataLoadError(error_msg, error_code="FILE_VALIDATION_FAILED", 
+                                  details=file_validation)
             
-            # Load CSV
-            self.data = pd.read_csv(self.data_path)
-            self.logger.info(f"Data loaded successfully: {self.data.shape[0]} samples, {self.data.shape[1]} columns")
+            # Log warnings if any
+            for warning in file_validation['warnings']:
+                self.logger.warning(f"File validation warning: {warning}")
             
-            # Extract subject IDs
+            # Step 2: Load CSV with error handling
+            self.progress_tracker.update_phase(1, "Loading CSV file")
+            self.logger.start_operation("CSV Loading")
+            
+            try:
+                self.data = pd.read_csv(self.data_path)
+                self.logger.end_operation("CSV Loading", 
+                                        samples=self.data.shape[0], 
+                                        columns=self.data.shape[1])
+            except Exception as e:
+                raise DataLoadError(f"Failed to load CSV file: {str(e)}", 
+                                  error_code="CSV_LOAD_FAILED")
+            
+            # Step 3: Validate DataFrame structure
+            self.progress_tracker.update_phase(1, "Validating DataFrame structure")
+            df_validation = self.validator.validate_dataframe(self.data)
+            
+            if not df_validation['valid']:
+                error_msg = f"DataFrame validation failed: {'; '.join(df_validation['errors'])}"
+                raise ValidationError(error_msg, error_code="DATAFRAME_VALIDATION_FAILED",
+                                    details=df_validation)
+            
+            # Log warnings and data info
+            for warning in df_validation['warnings']:
+                self.logger.warning(f"DataFrame validation warning: {warning}")
+            
+            self.logger.log_data_info(df_validation['data_info'])
+            
+            # Step 4: Extract subject IDs
+            self.progress_tracker.update_phase(1, "Extracting subject IDs")
             self.data[self.subject_id_column] = self.extract_subjects(self.data)
             
-            # Validate data
-            if not self.validate_data(self.data):
-                raise ValueError("Data validation failed")
-            
-            # Prepare features
+            # Step 5: Final validation and feature preparation
+            self.progress_tracker.update_phase(1, "Preparing features")
             self.features, self.target, self.subjects, self.feature_names = self.prepare_features(self.data)
             
-            self.logger.info("Data preparation completed successfully")
+            self.progress_tracker.finish_phase("Data loading completed successfully")
             return self.data
             
-        except Exception as e:
-            self.logger.error(f"Error loading data: {str(e)}")
+        except (DataLoadError, ValidationError) as e:
+            self.error_handler.handle_error(e, "Data loading")
+            self.progress_tracker.finish_phase("Data loading failed")
             raise
+        except Exception as e:
+            self.error_handler.handle_error(e, "Data loading")
+            self.progress_tracker.finish_phase("Data loading failed")
+            raise DataLoadError(f"Unexpected error during data loading: {str(e)}", 
+                              error_code="UNEXPECTED_ERROR")
     
     def extract_subjects(self, data: pd.DataFrame) -> pd.Series:
         """
@@ -126,7 +173,7 @@ class ParkinsonDataLoader(BaseDataLoader):
     
     def validate_data(self, data: pd.DataFrame) -> bool:
         """
-        Validate data integrity and structure
+        Validate data integrity and structure with enhanced error reporting
         
         Args:
             data: Input DataFrame
@@ -137,43 +184,40 @@ class ParkinsonDataLoader(BaseDataLoader):
         self.logger.info("Validating data integrity and structure")
         
         try:
-            # Check required columns
-            required_columns = ['name', self.target_column]
-            missing_columns = [col for col in required_columns if col not in data.columns]
-            if missing_columns:
-                self.logger.error(f"Missing required columns: {missing_columns}")
+            # Use the comprehensive validator
+            validation_results = self.validator.validate_dataframe(data)
+            
+            # Log all validation results
+            if validation_results['errors']:
+                for error in validation_results['errors']:
+                    self.logger.error(f"Validation error: {error}")
                 return False
             
-            # Check for empty dataset
-            if len(data) == 0:
-                self.logger.error("Dataset is empty")
-                return False
+            if validation_results['warnings']:
+                for warning in validation_results['warnings']:
+                    self.logger.warning(f"Validation warning: {warning}")
             
-            # Check target column values
-            target_values = data[self.target_column].unique()
-            if not all(val in [0, 1] for val in target_values):
-                self.logger.error(f"Target column contains invalid values: {target_values}")
-                return False
-            
-            # Check for missing values in target
-            if data[self.target_column].isnull().any():
-                self.logger.error("Target column contains missing values")
-                return False
-            
-            # Check subject ID extraction
+            # Additional subject-specific validation
             if self.subject_id_column in data.columns:
-                unique_subjects = data[self.subject_id_column].nunique()
-                if unique_subjects < 2:
-                    self.logger.error("Less than 2 unique subjects found")
+                subject_validation = self.validator.validate_subject_ids(data[self.subject_id_column])
+                
+                if not subject_validation['valid']:
+                    for error in subject_validation['errors']:
+                        self.logger.error(f"Subject validation error: {error}")
                     return False
                 
-                # Check subject-target relationship
+                if subject_validation['warnings']:
+                    for warning in subject_validation['warnings']:
+                        self.logger.warning(f"Subject validation warning: {warning}")
+                
+                # Check for subject leakage (subjects with mixed labels)
                 subject_target_counts = data.groupby(self.subject_id_column)[self.target_column].nunique()
                 mixed_subjects = subject_target_counts[subject_target_counts > 1]
                 if len(mixed_subjects) > 0:
-                    self.logger.warning(f"Subjects with mixed labels: {mixed_subjects.index.tolist()}")
+                    self.logger.warning(f"Subjects with mixed labels detected: {mixed_subjects.index.tolist()}")
+                    self.logger.warning("This may indicate data quality issues or legitimate mixed cases")
             
-            # Check feature columns
+            # Check feature columns if specified
             if self.feature_columns is not None:
                 missing_features = [col for col in self.feature_columns if col not in data.columns]
                 if missing_features:
@@ -189,7 +233,7 @@ class ParkinsonDataLoader(BaseDataLoader):
     
     def prepare_features(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
         """
-        Prepare feature matrix, target vector, and subject identifiers
+        Prepare feature matrix, target vector, and subject identifiers with enhanced validation
         
         Args:
             data: Input DataFrame
@@ -200,7 +244,7 @@ class ParkinsonDataLoader(BaseDataLoader):
         self.logger.info("Preparing features for machine learning")
         
         try:
-            # Determine feature columns
+            # Step 1: Determine feature columns
             if self.feature_columns is not None:
                 feature_cols = self.feature_columns
             else:
@@ -210,31 +254,66 @@ class ParkinsonDataLoader(BaseDataLoader):
             
             self.logger.info(f"Using {len(feature_cols)} features: {feature_cols}")
             
-            # Extract features
+            # Step 2: Extract features with validation
             X = data[feature_cols].values
             y = data[self.target_column].values
             subjects = data[self.subject_id_column].values
             
-            # Check for missing values in features
+            # Step 3: Validate feature matrix
+            feature_validation = self.validator.validate_feature_matrix(X, feature_cols)
+            
+            if not feature_validation['valid']:
+                error_msg = f"Feature matrix validation failed: {'; '.join(feature_validation['errors'])}"
+                raise ValidationError(error_msg, error_code="FEATURE_VALIDATION_FAILED",
+                                    details=feature_validation)
+            
+            # Log warnings
+            for warning in feature_validation['warnings']:
+                self.logger.warning(f"Feature validation warning: {warning}")
+            
+            # Step 4: Check for missing values in features
             missing_count = np.isnan(X).sum()
             if missing_count > 0:
                 self.logger.warning(f"Found {missing_count} missing values in features")
+                self.logger.warning("Consider using imputation strategies in preprocessing")
             
-            # Log data shapes
+            # Step 5: Log comprehensive data information
             self.logger.info(f"Feature matrix shape: {X.shape}")
             self.logger.info(f"Target vector shape: {y.shape}")
             self.logger.info(f"Subjects shape: {subjects.shape}")
             
-            # Log class distribution
+            # Log class distribution with detailed analysis
             unique, counts = np.unique(y, return_counts=True)
             class_dist = dict(zip(unique, counts))
             self.logger.info(f"Class distribution: {class_dist}")
             
+            # Calculate and log class imbalance ratio
+            if len(counts) == 2:
+                imbalance_ratio = max(counts) / min(counts)
+                self.logger.info(f"Class imbalance ratio: {imbalance_ratio:.2f}")
+                if imbalance_ratio > 2:
+                    self.logger.warning(f"Significant class imbalance detected (ratio: {imbalance_ratio:.2f})")
+                    self.logger.warning("Consider using class balancing strategies")
+            
+            # Log feature statistics
+            self.logger.info("Feature statistics:")
+            for i, feature_name in enumerate(feature_cols):
+                feature_data = X[:, i]
+                feature_data = feature_data[~np.isnan(feature_data)]  # Remove NaN values
+                if len(feature_data) > 0:
+                    self.logger.info(f"  {feature_name}: mean={np.mean(feature_data):.3f}, "
+                                   f"std={np.std(feature_data):.3f}, "
+                                   f"range=[{np.min(feature_data):.3f}, {np.max(feature_data):.3f}]")
+            
             return X, y, subjects, feature_cols
             
-        except Exception as e:
-            self.logger.error(f"Error preparing features: {str(e)}")
+        except ValidationError as e:
+            self.error_handler.handle_error(e, "Feature preparation")
             raise
+        except Exception as e:
+            self.error_handler.handle_error(e, "Feature preparation")
+            raise ProcessingError(f"Error preparing features: {str(e)}", 
+                                error_code="FEATURE_PREPARATION_FAILED")
     
     def get_subject_info(self) -> Dict[str, Any]:
         """
